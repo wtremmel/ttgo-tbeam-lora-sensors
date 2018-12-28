@@ -93,7 +93,7 @@ static osjob_t sendjob;
 
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 60;
+const unsigned TX_INTERVAL = 90;
 
 // Pin mapping
 const lmic_pinmap lmic_pins = {
@@ -264,6 +264,40 @@ void readSensors() {
   // read_ram();
 }
 
+void print_wakeup_reason(){
+  esp_sleep_wakeup_cause_t wakeup_reason;
+
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  switch(wakeup_reason)
+  {
+    case ESP_SLEEP_WAKEUP_EXT0 :
+      Log.notice(F("Wakeup caused by external signal using RTC_IO"));
+      break;
+    case ESP_SLEEP_WAKEUP_EXT1 :
+      Log.notice(F("Wakeup caused by external signal using RTC_CNTL"));
+      break;
+    case ESP_SLEEP_WAKEUP_TIMER :
+      Log.notice(F("Wakeup caused by timer"));
+      break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD :
+      Log.notice(F("Wakeup caused by touchpad"));
+      break;
+    case ESP_SLEEP_WAKEUP_ULP :
+      Log.notice(F("Wakeup caused by ULP program"));
+      break;
+    default :
+      Log.notice(F("Wakeup was not caused by deep sleep: %d\n"),wakeup_reason); break;
+  }
+}
+
+void sleepfor (int s) {
+  Log.verbose(F("sleepfor(%d)"),s);
+  esp_sleep_enable_timer_wakeup(s * 1000000);
+  // esp_deep_sleep_start();
+  Log.verbose(F("light sleep: %d"),esp_light_sleep_start());
+
+}
 
 
 void do_send(osjob_t* j){
@@ -275,6 +309,8 @@ void do_send(osjob_t* j){
         // Prepare upstream data transmission at the next possible time.
 
       // sleepfor(TX_INTERVAL);
+      if (setup_complete)
+        sleepfor(TX_INTERVAL);
 
       lpp.reset();
       readSensors();
@@ -403,7 +439,7 @@ void onEvent (ev_t ev) {
             }
             // Schedule next transmission
             // os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
-            os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
+            os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(1), do_send);
             break;
         case EV_LOST_TSYNC:
             Log.verbose(F("EV_LOST_TSYNC"));
@@ -511,6 +547,7 @@ void setup() {
   delay(5000);
 
   setup_logging();
+  print_wakeup_reason(); // if wakeup
 
   // setup Rain detector
   analogReadResolution(12);
