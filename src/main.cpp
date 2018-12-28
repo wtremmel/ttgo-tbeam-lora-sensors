@@ -198,15 +198,50 @@ void read_ram() {
   lpp.addDigitalInput(7, &stack_dummy - sbrk(0));
 }
 
-#if 0
 void read_rain() {
+  #if 0
   pinMode(rainPin,INPUT_PULLUP);
   delay(1000);
   unsigned int r = analogRead(rainPin);
   lpp.addDigitalInput(6,4096-r);
   pinMode(rainPin,INPUT);
+  #endif
 }
-#endif
+
+void read_GPS() {
+  Log.verbose(F("readGPS start"));
+  if (!GPS) {
+    Log.verbose(F("Initializing GPS"));
+    GPS.begin(9600, SERIAL_8N1, 12, 15);
+  }
+  if (GPS && GPS.available()) {
+    Log.verbose(F("Reading GPS"));
+    unsigned long start = millis();
+    do {
+      while (GPS.available() > 0) {
+        gps.encode(GPS.read());
+      }
+    } while (millis() - start < 1000);
+  }
+  if (gps.charsProcessed() < 10) {
+    Log.notice(F("No GPS data received"));
+  } else {
+    if (gps.location.isValid() && gps.location.isUpdated()) {
+      Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
+        (double)(gps.location.lat()),
+        (double)(gps.location.lng()),
+        (double)(gps.altitude.meters()));
+      lpp.addGPS(8,gps.location.lat(), gps.location.lng(), gps.altitude.meters());
+      Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
+        gps.speed.kmph(),
+        gps.course.deg());
+      Log.verbose(F("GPS time: val(%l)"),
+        gps.time.value());
+      Log.verbose(F("GPS date: val(%l)"),
+        gps.date.value());
+    }
+  }
+}
 
 void readSensors() {
   lpp.reset();
@@ -224,7 +259,8 @@ void readSensors() {
   if (voltage_found) {
     read_voltage();
   }
-  // read_rain();
+  read_rain();
+  read_GPS();
   // read_ram();
 }
 
@@ -367,7 +403,7 @@ void onEvent (ev_t ev) {
             }
             // Schedule next transmission
             // os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
-            os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(1), do_send);
+            os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
             break;
         case EV_LOST_TSYNC:
             Log.verbose(F("EV_LOST_TSYNC"));
@@ -478,6 +514,9 @@ void setup() {
 
   // setup Rain detector
   analogReadResolution(12);
+
+  // setup gps    GPS.begin(9600, SERIAL_8N1, 12, 15);
+  GPS.begin(9600, SERIAL_8N1, 12, 15);
 
 
     // LMIC init
