@@ -1,38 +1,11 @@
-/*******************************************************************************
- * Copyright (c) 2015 Thomas Telkamp and Matthijs Kooijman
- *
- * Permission is hereby granted, free of charge, to anyone
- * obtaining a copy of this document and accompanying files,
- * to do whatever they want with them without any restriction,
- * including, but not limited to, copying, modification and redistribution.
- * NO WARRANTY OF ANY KIND IS PROVIDED.
- *
- * This example sends a valid LoRaWAN packet with payload "Hello,
- * world!", using frequency and encryption settings matching those of
- * the The Things Network.
- *
- * This uses OTAA (Over-the-air activation), where where a DevEUI and
- * application key is configured, which are used in an over-the-air
- * activation procedure where a DevAddr and session keys are
- * assigned/generated for use with all further communication.
- *
- * Note: LoRaWAN per sub-band duty-cycle limitation is enforced (1% in
- * g1, 0.1% in g2), but not the TTN fair usage policy (which is probably
- * violated by this sketch when left running for longer)!
 
- * To use this sketch, first register your application and device with
- * the things network, to set or generate an AppEUI, DevEUI and AppKey.
- * Multiple devices can use the same AppEUI, but each device has its own
- * DevEUI and AppKey.
- *
- * Do not forget to define the radio type correctly in config.h.
- *
- *******************************************************************************/
 
 #include <lmic.h>
 #include <hal/hal.h>
 #include <SPI.h>
 #include <ArduinoLog.h>
+#include <esp_sleep.h>
+#include <WiFi.h>
 
 
 #define DEBUG 1
@@ -40,54 +13,45 @@
 #include <CayenneLPP.h>
 CayenneLPP lpp(51);
 
+#define RTCBUFSIZE (1024*3)
+#define RTCMAXOBJ 10
+
+typedef struct sendObject {
+  uint32_t timestamp;
+  uint32_t gpslong, gpslat, gpsalt;
+  uint32_t speed, direction;
+} sendObject_t;
+
+sendObject_t whereAmI;
+
+RTC_NOINIT_ATTR uint8_t rtcbufstart;
+RTC_NOINIT_ATTR int rtcbufindex;
+RTC_NOINIT_ATTR uint8_t rtcbuf[RTCBUFSIZE];
+RTC_NOINIT_ATTR uint8_t rtcobjlen[RTCMAXOBJ];
+RTC_NOINIT_ATTR uint16_t rtcobjstart[RTCMAXOBJ];
+
+
+
 #include <TinyGPS++.h>
 HardwareSerial GPS(1);
 TinyGPSPlus gps;
 
-// Sensor Libraries
-#include "Adafruit_Si7021.h"
-#include "Adafruit_BME280.h"
-#include "Adafruit_TSL2561_U.h"
-//#include "Adafruit_GFX.h"
-
-// Display Libraries
-#include <U8x8lib.h>
-
-// Global Objects
-Adafruit_Si7021 si7021;
-Adafruit_BME280 bme280;
-Adafruit_TSL2561_Unified tsl2561 = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT);
-U8X8_SH1106_128X64_NONAME_HW_I2C u8x8(/* reset=*/ U8X8_PIN_NONE);
-
-bool si7021_found = false;
-bool bme280_found = false;
-bool tsl2561_found= false;
-bool ecc508_found= false;
-bool voltage_found= true;
 
 bool setup_complete = false;
 bool led_dynamic = true; // LED shows if system is asleep or not
+bool gps_wait_for_lock = true;
 
+#include "tbeam.h"
 
-
-
-// This EUI must be in little-endian format, so least-significant-byte
-// first. When copying an EUI from ttnctl output, this means to reverse
-// the bytes. For TTN issued EUIs the last bytes should be 0xD5, 0xB3,
-// 0x70.
-static const u1_t PROGMEM APPEUI[8]={ 0x8A, 0x30, 0x01, 0xD0, 0x7E, 0xD5, 0xB3, 0x70 };
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
-
-// This should also be in little endian format, see above.
-static const u1_t PROGMEM DEVEUI[8]={ 0xAA, 0x28, 0xD2, 0xF2, 0x28, 0x55, 0x50, 0x00 };
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
+void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
 
-// This key should be in big endian format (or, since it is not really a
-// number but a block of memory, endianness does not really apply). In
-// practice, a key taken from ttnctl can be copied as-is.
-// The key shown here is the semtech default key.
-static const u1_t PROGMEM APPKEY[16] = { 0x4B, 0x56, 0x90, 0xC0, 0x42, 0xA3, 0xF7, 0x7C, 0xE4, 0x52, 0xC4, 0x98, 0x94, 0x32, 0xC9, 0x70 };
-void os_getDevKey (u1_t* buf) {  memcpy_P(buf, APPKEY, 16);}
+RTC_NOINIT_ATTR int RTCseqnoUp, RTCseqnoDn;
+RTC_NOINIT_ATTR u4_t otaaDevAddr;
+RTC_NOINIT_ATTR u1_t otaaNetwKey[16];
+RTC_NOINIT_ATTR u1_t otaaApRtKey[16];
+
 
 static osjob_t sendjob;
 
@@ -99,12 +63,59 @@ const unsigned TX_INTERVAL = 90;
 const lmic_pinmap lmic_pins = {
     .nss = 18,
     .rxtx = LMIC_UNUSED_PIN,
-    .rst = LMIC_UNUSED_PIN,
+    .rst = 23,
     .dio = {26,33,32},
 };
 
 // forward declarations
 void setup_I2C(void);
+
+void storeFrameCounters() {
+  RTCseqnoUp = LMIC.seqnoUp;
+  RTCseqnoDn = LMIC.seqnoDn;
+  Log.verbose(F("Counters saved. up=%d down=%d"),RTCseqnoUp,RTCseqnoDn);
+}
+
+void restoreFrameCounters() {
+  LMIC.seqnoUp = RTCseqnoUp;
+  LMIC.seqnoDn = RTCseqnoDn;
+  Log.verbose(F("Counters restored. up=%d down=%d"),RTCseqnoUp,RTCseqnoDn);
+
+}
+
+bool pushrtcbuffer(uint8_t* obj, uint8_t size) {
+  if (((rtcbufstart + size) <= RTCBUFSIZE) &&
+      (rtcbufindex < RTCMAXOBJ)) {
+    memcpy(rtcbuf + rtcbufstart,obj,size);
+    rtcbufindex++;
+    rtcobjstart[rtcbufindex] = rtcbufstart;
+    rtcobjlen[rtcbufindex] = size;
+    rtcbufstart += size;
+    return true;
+  }
+  return false;
+}
+
+ bool poprtcbuffer() {
+   // dump the last object from the buffer
+   if (rtcbufindex >= 0) {
+     rtcbufstart -= rtcobjlen[rtcbufindex];
+     rtcbufindex--;
+     return true;
+   }
+   return false;
+ }
+
+void dumprtcbuffer() {
+  #if DEBUG
+  int i;
+  Log.verbose(F("RTCbufindex = %d"),rtcbufindex);
+  Log.verbose(F("RTCbufstart = %d"),rtcbufstart);
+  for (i=0; i <= rtcbufindex; i++) {
+    Log.verbose(F("RTC entry %d len = %d"),i,rtcobjlen[i]);
+  }
+  #endif
+}
 
 void setup_serial() {
   Serial.begin(115200);
@@ -166,47 +177,12 @@ float my_voltage() {
 }
 
 
-// -------------------------
-void read_tsl2561() {
-  sensors_event_t event;
-  Log.verbose(F("read_tsl2561"));
-  tsl2561.getEvent(&event);
-  lpp.addLuminosity(4,event.light);
-}
-
-void read_si7021() {
-  Log.verbose(F("read_si70721"));
-  lpp.addTemperature(1, si7021.readTemperature());
-  lpp.addRelativeHumidity(2, si7021.readHumidity());
-}
-
-void read_bme280() {
-  Log.verbose(F("read_bme280"));
-  lpp.addTemperature(1,bme280.readTemperature());
-  lpp.addRelativeHumidity(2,bme280.readHumidity());
-  lpp.addBarometricPressure(3,bme280.readPressure() / 100.0F);
-}
 
 void read_voltage() {
   float v = my_voltage();
-  lpp.addAnalogInput(5,v);
+  // lpp.addAnalogInput(5,v);
 }
 
-extern "C" char *sbrk(int i);
-void read_ram() {
-  char stack_dummy = 0;
-  lpp.addDigitalInput(7, &stack_dummy - sbrk(0));
-}
-
-void read_rain() {
-  #if 0
-  pinMode(rainPin,INPUT_PULLUP);
-  delay(1000);
-  unsigned int r = analogRead(rainPin);
-  lpp.addDigitalInput(6,4096-r);
-  pinMode(rainPin,INPUT);
-  #endif
-}
 
 void read_GPS() {
   Log.verbose(F("readGPS start"));
@@ -214,54 +190,51 @@ void read_GPS() {
     Log.verbose(F("Initializing GPS"));
     GPS.begin(9600, SERIAL_8N1, 12, 15);
   }
-  if (GPS && GPS.available()) {
-    Log.verbose(F("Reading GPS"));
-    unsigned long start = millis();
-    do {
-      while (GPS.available() > 0) {
-        gps.encode(GPS.read());
-      }
-    } while (millis() - start < 1000);
-  }
-  if (gps.charsProcessed() < 10) {
+  Log.verbose(F("Reading GPS"));
+  unsigned long start = millis();
+  do {
+    while (GPS.available() > 0) {
+      gps.encode(GPS.read());
+      if (gps.charsProcessed() > 10)
+        gps_wait_for_lock = false;
+    }
+  } while (millis() - start < 2000 || gps_wait_for_lock);
+if (gps.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
   } else {
+    lpp.reset();
     if (gps.location.isValid() && gps.location.isUpdated()) {
       Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
         (double)(gps.location.lat()),
         (double)(gps.location.lng()),
         (double)(gps.altitude.meters()));
-      lpp.addGPS(8,gps.location.lat(), gps.location.lng(), gps.altitude.meters());
+      lpp.addGPS(2,gps.location.lat(), gps.location.lng(), gps.altitude.meters());
+
+      whereAmI.gpslong = (uint32_t) (gps.location.lng() * 1000);
+      whereAmI.gpslat = (uint32_t) (gps.location.lat() * 1000);
+      whereAmI.gpsalt = (uint32_t) (gps.altitude.meters() * 100);
+      whereAmI.speed = (uint32_t) (gps.speed.kmph() * 100);
+      whereAmI.direction = (uint32_t) (gps.course.deg() * 100);
+
       Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
         gps.speed.kmph(),
         gps.course.deg());
-      Log.verbose(F("GPS time: val(%l)"),
-        gps.time.value());
-      Log.verbose(F("GPS date: val(%l)"),
-        gps.date.value());
+      lpp.addDirection(3,gps.course.deg());
+
+      struct tm tm;
+      tm.tm_sec=gps.time.second();
+      tm.tm_min=gps.time.minute();
+      tm.tm_hour=gps.time.hour();
+      tm.tm_mday=gps.date.day();
+      tm.tm_mon=gps.date.month()-1;
+      tm.tm_year=gps.date.year()+2000;
+
+      Log.verbose(F("Unix time %l"),mktime(&tm));
+      lpp.addUnixTime(1,mktime(&tm));
+      whereAmI.timestamp = mktime(&tm);
+      pushrtcbuffer(lpp.getBuffer(),lpp.getSize());
     }
   }
-}
-
-void readSensors() {
-  lpp.reset();
-  setup_I2C();
-
-  if (si7021_found) {
-    read_si7021();
-  }
-  if (bme280_found) {
-    read_bme280();
-  }
-  if (tsl2561_found) {
-    read_tsl2561();
-  }
-  if (voltage_found) {
-    read_voltage();
-  }
-  read_rain();
-  read_GPS();
-  // read_ram();
 }
 
 void print_wakeup_reason(){
@@ -292,9 +265,13 @@ void print_wakeup_reason(){
 }
 
 void sleepfor (int s) {
+  if (!setup_complete)
+    return;
+
+  storeFrameCounters();
   Log.verbose(F("sleepfor(%d)"),s);
   esp_sleep_enable_timer_wakeup(s * 1000000);
-  // esp_deep_sleep_start();
+  esp_deep_sleep_start();
   Log.verbose(F("light sleep: %d"),esp_light_sleep_start());
 
 }
@@ -307,19 +284,18 @@ void do_send(osjob_t* j){
       (F("OP_TXRXPEND, not sending"));
     } else {
         // Prepare upstream data transmission at the next possible time.
-
-      // sleepfor(TX_INTERVAL);
-      if (setup_complete)
-        sleepfor(TX_INTERVAL);
-
-      lpp.reset();
-      readSensors();
-
-      LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 0);
-      Log.verbose(F("Packet queued"));
+      // send data
+      while (rtcbufindex >= 0) {
+        dumprtcbuffer();
+        // LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 0);
+        LMIC_setTxData2(1, (unsigned char *) &whereAmI, sizeof(sendObject_t), 0);
+        Log.verbose(F("Packet queued"));
+        poprtcbuffer();
+      }
+      sleepfor(TX_INTERVAL);
     }
     // Next TX is scheduled after TX_COMPLETE event.
-    setup_complete = true;
+
 }
 
 // -------------- Command Processing -----------------
@@ -414,7 +390,10 @@ void onEvent (ev_t ev) {
             break;
         case EV_JOINED:
             Log.verbose(F("EV_JOINED"));
-
+            otaaDevAddr = LMIC.devaddr;
+            memcpy_P(otaaNetwKey, LMIC.nwkKey, 16);
+            memcpy_P(otaaApRtKey, LMIC.artKey, 16);
+            Log.verbose(F("got devaddr = 0x%X"), LMIC.devaddr);
             // Disable link check validation (automatically enabled
             // during join, but not supported by TTN at this time).
             LMIC_setLinkCheckMode(0);
@@ -428,7 +407,6 @@ void onEvent (ev_t ev) {
         case EV_REJOIN_FAILED:
             Log.verbose(F("EV_REJOIN_FAILED"));
             break;
-            break;
         case EV_TXCOMPLETE:
             Log.verbose(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK)
@@ -437,6 +415,7 @@ void onEvent (ev_t ev) {
               Log.verbose(F("Received %d bytes of payload"),LMIC.dataLen);
               process_received_lora(LMIC.dataLen,LMIC.frame);
             }
+            storeFrameCounters();
             // Schedule next transmission
             // os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
             os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(1), do_send);
@@ -457,71 +436,28 @@ void onEvent (ev_t ev) {
         case EV_LINK_ALIVE:
             Log.verbose(F("EV_LINK_ALIVE"));
             break;
+        case EV_SCAN_FOUND:
+            Log.verbose(F("EV_SCAN_FOUND"));
+            break;
+        case EV_TXSTART:
+            Log.verbose(F("EV_TXSTART"));
+            break;
+        case EV_TXCANCELED:
+            Log.verbose(F("EV_TXCANCELED"));
+            break;
+        case EV_RXSTART:
+            Log.verbose(F("EV_RXSTART"));
+            break;
+        case EV_JOIN_TXCOMPLETE:
+            Log.verbose(F("EV_JOIN_TXCOMPLETE: no join accepted"));
+            break;
          default:
-            Log.verbose(F("Unknown event"));
+            Log.verbose(F("Unknown event %d"),ev);
             break;
     }
 }
 
 
-
-//
-// Scan for sensors
-//
-void setup_I2C() {
-  byte error, address;
-  unsigned int devices=0;
-
-// 0x29 TSL45315 (Light)
-// 0x38 VEML6070 (Light)
-// 0x39 TSL2561
-// 0x40 SI7021
-// 0x48 4*AD converter
-// 0x4a GY49 or MAX44009 Light Sensor
-// 0x50 PCF8583P
-// 0x57 ATMEL732
-// 0x68 DS3231 Clock
-// 0x76 BME280
-// 0x77 BME680 (also BMP180)
-
-  Log.verbose("Scanning i2c bus");
-  Wire.begin();
-  Wire.setClock(10000);
-  for(address = 1; address < 127; address++ ) {
-    Log.verbose(F("Trying 0x%x"),address);
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission(false);
-
-    if (error == 0) {
-      Log.verbose(F("I2C device found at address 0x%x !"),address);
-      devices++;
-
-      if ((address == 0x39) || (address == 0x29) || (address == 0x49)) {
-        tsl2561 = Adafruit_TSL2561_Unified(address);
-        tsl2561_found = tsl2561.begin();
-        Log.verbose(F("TSL2561 found? %T"),tsl2561_found);
-        if (tsl2561_found) {
-          // init the sensor
-          tsl2561.enableAutoRange(true);
-          tsl2561.setIntegrationTime(TSL2561_INTEGRATIONTIME_101MS);
-        }
-      }
-      if (address == 0x40) {
-        // SI7021
-        si7021 = Adafruit_Si7021();
-        si7021_found = si7021.begin();
-        Log.verbose(F("Si7021 found? %T"),si7021_found);
-      }
-
-      if (address == 0x76 || address == 0x77) {
-        // BME280
-        bme280_found = bme280.begin(address);
-        Log.verbose(F("BME280 found? %T"),bme280_found);
-      }
-    }
-  }
-  Log.verbose(F("i2c bus scanning complete, %d devices"),devices);
-}
 
 // Logging helper routines
 void printTimestamp(Print* _logOutput) {
@@ -542,31 +478,54 @@ void setup_logging() {
   Log.verbose("Logging has started");
 }
 
+void setOrRestorePersistentCounters() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  if ((reason != ESP_RST_DEEPSLEEP) && (reason != ESP_RST_SW)) {
+    LMIC.seqnoUp = 0;
+    LMIC.seqnoDn = 0;
+    rtcbufstart = 0;
+    rtcbufindex = -1;
+    gps_wait_for_lock = true;
+    Log.verbose(F("rtc data initialized"));
+  } else {
+    restoreFrameCounters();
+    gps_wait_for_lock = false;
+  }
+  Log.verbose(F("LMIC.seqnoUp = %d"),LMIC.seqnoUp);
+  Log.verbose(F("LMIC.seqnoDn = %d"),LMIC.seqnoDn);
+  Log.verbose(F("rtcbufstart = %d"),rtcbufstart);
+  Log.verbose(F("rtcbufindex = %d"),rtcbufindex);
+}
+
+
 void setup() {
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
   setup_serial();
   delay(5000);
 
   setup_logging();
   print_wakeup_reason(); // if wakeup
-
-  // setup Rain detector
-  analogReadResolution(12);
-
-  // setup gps    GPS.begin(9600, SERIAL_8N1, 12, 15);
-  GPS.begin(9600, SERIAL_8N1, 12, 15);
-
-
-    // LMIC init
+  // LMIC init
   os_init();
     // Reset the MAC state. Session and pending data transfers will be discarded.
   LMIC_reset();
 
+  esp_reset_reason_t reason = esp_reset_reason();
+  if ((reason == ESP_RST_DEEPSLEEP) || (reason == ESP_RST_SW)) {
+    LMIC_setSession(0x1, otaaDevAddr, otaaNetwKey, otaaApRtKey);
+  }
+  LMIC_setLinkCheckMode(0);
+  setOrRestorePersistentCounters();
 
-    // Start job (sending automatically starts OTAA too)
-    do_send(&sendjob);
+  // setup gps
+  Log.verbose(F("Initializing GPS"));
+  GPS.begin(9600, SERIAL_8N1, 12, 15);
+  read_GPS();
 
-    setup_complete = true;
-
+  // Start job (sending automatically starts OTAA too)
+  do_send(&sendjob);
 }
 
 
