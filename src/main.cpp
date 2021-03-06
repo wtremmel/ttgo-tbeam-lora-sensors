@@ -5,32 +5,44 @@
 #include <SPI.h>
 #include <ArduinoLog.h>
 #include <esp_sleep.h>
-#include <WiFi.h>
+// #include <WiFi.h>
 
 
 #define DEBUG 1
+#define BATTERY_PIN 35
 
-#include <CayenneLPP.h>
-CayenneLPP lpp(51);
-
-#define RTCBUFSIZE (1024*3)
-#define RTCMAXOBJ 10
+#define RTCMAXOBJ 100
 
 typedef struct sendObject {
   uint32_t timestamp;
   uint32_t gpslong, gpslat, gpsalt;
   uint32_t speed, direction;
+  uint16_t voltage;
 } sendObject_t;
+
+/*
+Payload decoder function:
+function decodeUplink(input) {
+  var data = {};
+  data.timestamp = (input.bytes[0]) + (input.bytes[1]<<8) + (input.bytes[2]<<16) +  (input.bytes[3]<<24);
+  data.long = ((input.bytes[4]) + (input.bytes[5]<<8) + (input.bytes[6]<<16) +  (input.bytes[7]<<24)) / 10000.0;
+  data.lat = ((input.bytes[8]) + (input.bytes[9]<<8) + (input.bytes[10]<<16) +  (input.bytes[11]<<24)) / 10000.0;
+  data.alt = ((input.bytes[12]) + (input.bytes[13]<<8) + (input.bytes[14]<<16) +  (input.bytes[15]<<24)) / 100.0;
+  data.speed = ((input.bytes[16]) + (input.bytes[17]<<8) + (input.bytes[18]<<16) +  (input.bytes[19]<<24)) / 100.0;
+  data.direction = ((input.bytes[20]) + (input.bytes[21]<<8) + (input.bytes[22]<<16) +  (input.bytes[23]<<24)) / 100.0;
+  data.voltage = ((input.bytes[24]) + (input.bytes[25]<<8)) / 100.0
+  return {
+    data: data
+  };
+}
+}
+
+*/
 
 sendObject_t whereAmI;
 
-RTC_NOINIT_ATTR uint8_t rtcbufstart;
-RTC_NOINIT_ATTR int rtcbufindex;
-RTC_NOINIT_ATTR uint8_t rtcbuf[RTCBUFSIZE];
-RTC_NOINIT_ATTR uint8_t rtcobjlen[RTCMAXOBJ];
-RTC_NOINIT_ATTR uint16_t rtcobjstart[RTCMAXOBJ];
-
-
+RTC_NOINIT_ATTR sendObject_t objbuffer[RTCMAXOBJ];
+RTC_NOINIT_ATTR int buflen;
 
 #include <TinyGPS++.h>
 HardwareSerial GPS(1);
@@ -83,37 +95,28 @@ void restoreFrameCounters() {
 
 }
 
-bool pushrtcbuffer(uint8_t* obj, uint8_t size) {
-  if (((rtcbufstart + size) <= RTCBUFSIZE) &&
-      (rtcbufindex < RTCMAXOBJ)) {
-    memcpy(rtcbuf + rtcbufstart,obj,size);
-    rtcbufindex++;
-    rtcobjstart[rtcbufindex] = rtcbufstart;
-    rtcobjlen[rtcbufindex] = size;
-    rtcbufstart += size;
+bool pushrtcbuffer(sendObject_t *o) {
+  if (buflen < RTCMAXOBJ) {
+    memcpy((objbuffer + buflen),o,sizeof(sendObject_t));
+    buflen++;
     return true;
   }
   return false;
 }
 
- bool poprtcbuffer() {
-   // dump the last object from the buffer
-   if (rtcbufindex >= 0) {
-     rtcbufstart -= rtcobjlen[rtcbufindex];
-     rtcbufindex--;
-     return true;
-   }
-   return false;
- }
+sendObject_t *poprtcbuffer() {
+  if (buflen > 0) {
+    buflen--;
+    return objbuffer + buflen;
+  } else {
+    return NULL;
+  }
+}
 
 void dumprtcbuffer() {
   #if DEBUG
-  int i;
-  Log.verbose(F("RTCbufindex = %d"),rtcbufindex);
-  Log.verbose(F("RTCbufstart = %d"),rtcbufstart);
-  for (i=0; i <= rtcbufindex; i++) {
-    Log.verbose(F("RTC entry %d len = %d"),i,rtcobjlen[i]);
-  }
+
+  Log.verbose(F("buflen = %d"),buflen);
   #endif
 }
 
@@ -124,65 +127,13 @@ void setup_serial() {
 #endif
 }
 
-// ----------- Battery stuff
-#define HAS_BATTERY_PROBE ADC1_GPIO35_CHANNEL
-#define BATT_FACTOR 2
-
-#define DEFAULT_VREF 1100 // tbd: use adc2_vref_to_gpio() for better estimate
-#define NO_OF_SAMPLES 64  // we do some multisampling to get better values
-#include <driver/adc.h>
-#include <esp_adc_cal.h>
-esp_adc_cal_characteristics_t *adc_characs =
-    (esp_adc_cal_characteristics_t *)calloc(
-        1, sizeof(esp_adc_cal_characteristics_t));
-
-static const adc1_channel_t adc_channel = HAS_BATTERY_PROBE;
-static const adc_atten_t atten = ADC_ATTEN_DB_11;
-static const adc_unit_t unit = ADC_UNIT_1;
-
-void calibrate_voltage(void) {
-  // configure ADC
-  ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_12));
-  ESP_ERROR_CHECK(adc1_config_channel_atten(adc_channel, atten));
-  // calibrate ADC
-  esp_adc_cal_value_t val_type = esp_adc_cal_characterize(
-      unit, atten, ADC_WIDTH_BIT_12, DEFAULT_VREF, adc_characs);
-  // show ADC characterization base
-  if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
-    ESP_LOGI(TAG,
-             "ADC characterization based on Two Point values stored in eFuse");
-  } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
-    ESP_LOGI(TAG,
-             "ADC characterization based on reference voltage stored in eFuse");
-  } else {
-    ESP_LOGI(TAG, "ADC characterization based on default reference voltage");
-  }
+float getBatteryVoltage() {
+  float vBat;
+  // we've set 10-bit ADC resolution 2^10=1024 and voltage divider makes it half of maximum readable value (which is 3.3V)
+  vBat = analogRead(BATTERY_PIN) * 2.0 * (3.3 / 1024.0);
+  Log.verbose(F("vBat = %F"),vBat);
+  return vBat;
 }
-
-float my_voltage() {
-  // multisample ADC
-  uint32_t adc_reading = 0;
-  for (int i = 0; i < NO_OF_SAMPLES; i++) {
-    adc_reading += adc1_get_raw(adc_channel);
-  }
-  adc_reading /= NO_OF_SAMPLES;
-  // Convert ADC reading to voltage in mV
-  uint16_t voltage =
-      (uint16_t)esp_adc_cal_raw_to_voltage(adc_reading, adc_characs);
-#ifdef BATT_FACTOR
-  voltage *= BATT_FACTOR;
-#endif
-  ESP_LOGD(TAG, "Raw: %d / Voltage: %dmV", adc_reading, voltage);
-  return (float)(voltage) / 100.0;
-}
-
-
-
-void read_voltage() {
-  float v = my_voltage();
-  // lpp.addAnalogInput(5,v);
-}
-
 
 void read_GPS() {
   Log.verbose(F("readGPS start"));
@@ -202,16 +153,14 @@ void read_GPS() {
 if (gps.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
   } else {
-    lpp.reset();
     if (gps.location.isValid() && gps.location.isUpdated()) {
       Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
         (double)(gps.location.lat()),
         (double)(gps.location.lng()),
         (double)(gps.altitude.meters()));
-      lpp.addGPS(2,gps.location.lat(), gps.location.lng(), gps.altitude.meters());
 
-      whereAmI.gpslong = (uint32_t) (gps.location.lng() * 1000);
-      whereAmI.gpslat = (uint32_t) (gps.location.lat() * 1000);
+      whereAmI.gpslong = (uint32_t) (gps.location.lng() * 10000);
+      whereAmI.gpslat = (uint32_t) (gps.location.lat() * 10000);
       whereAmI.gpsalt = (uint32_t) (gps.altitude.meters() * 100);
       whereAmI.speed = (uint32_t) (gps.speed.kmph() * 100);
       whereAmI.direction = (uint32_t) (gps.course.deg() * 100);
@@ -219,7 +168,7 @@ if (gps.charsProcessed() < 10) {
       Log.verbose(F("GPS movement: speed(%F km/h) deg(%F) "),
         gps.speed.kmph(),
         gps.course.deg());
-      lpp.addDirection(3,gps.course.deg());
+
 
       struct tm tm;
       tm.tm_sec=gps.time.second();
@@ -227,12 +176,17 @@ if (gps.charsProcessed() < 10) {
       tm.tm_hour=gps.time.hour();
       tm.tm_mday=gps.date.day();
       tm.tm_mon=gps.date.month()-1;
-      tm.tm_year=gps.date.year()+2000;
+      tm.tm_year=gps.date.year()-1900;
 
-      Log.verbose(F("Unix time %l"),mktime(&tm));
-      lpp.addUnixTime(1,mktime(&tm));
-      whereAmI.timestamp = mktime(&tm);
-      pushrtcbuffer(lpp.getBuffer(),lpp.getSize());
+      Log.verbose(F("h=%d m=%d s=%d"),tm.tm_hour,tm.tm_min,tm.tm_sec);
+      Log.verbose(F("d=%d m=%d y=%d"),tm.tm_mday,tm.tm_mon,tm.tm_year);
+      Log.verbose(F("asctime = %s"),asctime(&tm));
+      whereAmI.timestamp = (uint32_t) mktime(&tm);
+      Log.verbose(F("Unix time %l"),whereAmI.timestamp);
+      Log.verbose(F("ctime = %s"),ctime((time_t *) &whereAmI.timestamp));
+
+      whereAmI.voltage = (uint16_t)(getBatteryVoltage() * 100.0);
+      pushrtcbuffer(&whereAmI);
     }
   }
 }
@@ -285,12 +239,14 @@ void do_send(osjob_t* j){
     } else {
         // Prepare upstream data transmission at the next possible time.
       // send data
-      while (rtcbufindex >= 0) {
+      while (buflen > 0) {
+        sendObject_t *o;
         dumprtcbuffer();
-        // LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 0);
-        LMIC_setTxData2(1, (unsigned char *) &whereAmI, sizeof(sendObject_t), 0);
-        Log.verbose(F("Packet queued"));
-        poprtcbuffer();
+        o = poprtcbuffer();
+        if (o != NULL) {
+          LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 0);
+          Log.verbose(F("Packet queued"));
+        }
       }
       sleepfor(TX_INTERVAL);
     }
@@ -483,8 +439,7 @@ void setOrRestorePersistentCounters() {
   if ((reason != ESP_RST_DEEPSLEEP) && (reason != ESP_RST_SW)) {
     LMIC.seqnoUp = 0;
     LMIC.seqnoDn = 0;
-    rtcbufstart = 0;
-    rtcbufindex = -1;
+    buflen = 0;
     gps_wait_for_lock = true;
     Log.verbose(F("rtc data initialized"));
   } else {
@@ -493,14 +448,17 @@ void setOrRestorePersistentCounters() {
   }
   Log.verbose(F("LMIC.seqnoUp = %d"),LMIC.seqnoUp);
   Log.verbose(F("LMIC.seqnoDn = %d"),LMIC.seqnoDn);
-  Log.verbose(F("rtcbufstart = %d"),rtcbufstart);
-  Log.verbose(F("rtcbufindex = %d"),rtcbufindex);
+  Log.verbose(F("buflen = %d"),buflen);
 }
 
 
 void setup() {
-  WiFi.mode(WIFI_OFF);
+  // WiFi.mode(WIFI_OFF);
   btStop();
+
+  adcAttachPin(BATTERY_PIN);
+  // adcStart(BATTERY_PIN);
+  analogReadResolution(10);
 
   setup_serial();
   delay(5000);
