@@ -42,7 +42,8 @@ function decodeUplink(input) {
 sendObject_t whereAmI;
 
 RTC_NOINIT_ATTR sendObject_t objbuffer[RTCMAXOBJ];
-RTC_NOINIT_ATTR int buflen;
+RTC_NOINIT_ATTR int buflen, rtcqueued;
+static int txcounter = 0;
 
 #include <TinyGPS++.h>
 HardwareSerial GPS(1);
@@ -52,6 +53,7 @@ TinyGPSPlus gps;
 bool setup_complete = false;
 bool led_dynamic = true; // LED shows if system is asleep or not
 bool gps_wait_for_lock = true;
+uint32_t lastGPS = 0;
 
 #include "tbeam.h"
 
@@ -70,6 +72,7 @@ static osjob_t sendjob;
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
 const unsigned TX_INTERVAL = 90;
+const unsigned GPS_INTERVAL = 60;
 
 // Pin mapping
 const lmic_pinmap lmic_pins = {
@@ -104,6 +107,15 @@ bool pushrtcbuffer(sendObject_t *o) {
   return false;
 }
 
+sendObject_t *toprtcbuffer() {
+  if (buflen > 0) {
+    return objbuffer + (buflen-1);
+  } else {
+    return NULL;
+  }
+
+}
+
 sendObject_t *poprtcbuffer() {
   if (buflen > 0) {
     buflen--;
@@ -112,6 +124,7 @@ sendObject_t *poprtcbuffer() {
     return NULL;
   }
 }
+
 
 void dumprtcbuffer() {
   #if DEBUG
@@ -144,7 +157,9 @@ void read_GPS() {
   Log.verbose(F("Reading GPS"));
   unsigned long start = millis();
   do {
+    os_runloop_once();
     while (GPS.available() > 0) {
+      os_runloop_once();
       gps.encode(GPS.read());
       if (gps.charsProcessed() > 10)
         gps_wait_for_lock = false;
@@ -178,9 +193,6 @@ if (gps.charsProcessed() < 10) {
       tm.tm_mon=gps.date.month()-1;
       tm.tm_year=gps.date.year()-1900;
 
-      Log.verbose(F("h=%d m=%d s=%d"),tm.tm_hour,tm.tm_min,tm.tm_sec);
-      Log.verbose(F("d=%d m=%d y=%d"),tm.tm_mday,tm.tm_mon,tm.tm_year);
-      Log.verbose(F("asctime = %s"),asctime(&tm));
       whereAmI.timestamp = (uint32_t) mktime(&tm);
       Log.verbose(F("Unix time %l"),whereAmI.timestamp);
       Log.verbose(F("ctime = %s"),ctime((time_t *) &whereAmI.timestamp));
@@ -235,20 +247,22 @@ void do_send(osjob_t* j){
 
     // Check if there is not a current TX/RX job running
     if (LMIC.opmode & OP_TXRXPEND) {
-      (F("OP_TXRXPEND, not sending"));
+      Log.notice(F("OP_TXRXPEND, not sending"));
     } else {
         // Prepare upstream data transmission at the next possible time.
       // send data
-      while (buflen > 0) {
+      if (buflen > 0) { //  && rtcqueued == 0) {
         sendObject_t *o;
         dumprtcbuffer();
-        o = poprtcbuffer();
+        o = toprtcbuffer();
         if (o != NULL) {
+          rtcqueued++;
           LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 0);
           Log.verbose(F("Packet queued"));
         }
+      } else {
+        sleepfor(TX_INTERVAL);
       }
-      sleepfor(TX_INTERVAL);
     }
     // Next TX is scheduled after TX_COMPLETE event.
 
@@ -353,6 +367,9 @@ void onEvent (ev_t ev) {
             // Disable link check validation (automatically enabled
             // during join, but not supported by TTN at this time).
             LMIC_setLinkCheckMode(0);
+            LMIC_setAdrMode(0);
+            LMIC.dn2Dr = DR_SF9; // added
+
             break;
         case EV_RFU1:
             Log.verbose(F("EV_RFU1"));
@@ -364,17 +381,25 @@ void onEvent (ev_t ev) {
             Log.verbose(F("EV_REJOIN_FAILED"));
             break;
         case EV_TXCOMPLETE:
+            txcounter = 0;
+            poprtcbuffer();
+            if (rtcqueued > 0)
+              rtcqueued--;
+
             Log.verbose(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
-            if (LMIC.txrxFlags & TXRX_ACK)
+            if (LMIC.txrxFlags & TXRX_ACK) {
               Log.verbose(F("Received ack"));
+            }
             if (LMIC.dataLen) {
               Log.verbose(F("Received %d bytes of payload"),LMIC.dataLen);
               process_received_lora(LMIC.dataLen,LMIC.frame);
             }
+
             storeFrameCounters();
             // Schedule next transmission
             // os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
-            os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(1), do_send);
+            //os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(10), do_send);
+            os_setCallback(&sendjob,do_send);
             break;
         case EV_LOST_TSYNC:
             Log.verbose(F("EV_LOST_TSYNC"));
@@ -396,7 +421,9 @@ void onEvent (ev_t ev) {
             Log.verbose(F("EV_SCAN_FOUND"));
             break;
         case EV_TXSTART:
-            Log.verbose(F("EV_TXSTART"));
+            Log.verbose(F("EV_TXSTART: %d"),txcounter++);
+            if (txcounter >= 10)
+              sleepfor(TX_INTERVAL);
             break;
         case EV_TXCANCELED:
             Log.verbose(F("EV_TXCANCELED"));
@@ -440,6 +467,7 @@ void setOrRestorePersistentCounters() {
     LMIC.seqnoUp = 0;
     LMIC.seqnoDn = 0;
     buflen = 0;
+    rtcqueued = 0;
     gps_wait_for_lock = true;
     Log.verbose(F("rtc data initialized"));
   } else {
@@ -469,26 +497,41 @@ void setup() {
   os_init();
     // Reset the MAC state. Session and pending data transfers will be discarded.
   LMIC_reset();
+  LMIC_setClockError(MAX_CLOCK_ERROR);
+
 
   esp_reset_reason_t reason = esp_reset_reason();
   if ((reason == ESP_RST_DEEPSLEEP) || (reason == ESP_RST_SW)) {
     LMIC_setSession(0x1, otaaDevAddr, otaaNetwKey, otaaApRtKey);
   }
   LMIC_setLinkCheckMode(0);
+  LMIC_setDrTxpow(DR_SF7,14);
+  // TTN uses SF9 for its RX2 window.
+  LMIC.dn2Dr = SF9;
+
   setOrRestorePersistentCounters();
 
   // setup gps
   Log.verbose(F("Initializing GPS"));
   GPS.begin(9600, SERIAL_8N1, 12, 15);
-  read_GPS();
+  // read_GPS();
 
   // Start job (sending automatically starts OTAA too)
-  do_send(&sendjob);
+  // do_send(&sendjob);
 }
 
 
 void loop() {
-  setup_complete = true;
-  // Log.verbose(F("entering main loop"));
   os_runloop_once();
+
+  if (!setup_complete || (millis() > lastGPS + (GPS_INTERVAL * 1000))) {
+    Log.verbose("main loop: reading GPS");
+    read_GPS();
+    lastGPS = millis();
+    if (buflen > 0) {
+      do_send(&sendjob);
+    }
+  }
+  setup_complete = true;
+
 }
