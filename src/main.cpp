@@ -10,8 +10,15 @@
 
 #define DEBUG 1
 #define BATTERY_PIN 35
+#define DEEPSLEEP 0
 
-#define RTCMAXOBJ 100
+#if DEEPSLEEP
+#warning "Deep Sleep defined"
+#else
+#warning "Light Sleep defined"
+#endif
+
+
 
 typedef struct sendObject {
   uint32_t timestamp;
@@ -41,8 +48,24 @@ function decodeUplink(input) {
 
 sendObject_t whereAmI;
 
+#if DEEPSLEEP
+#define RTCMAXOBJ 100
 RTC_NOINIT_ATTR sendObject_t objbuffer[RTCMAXOBJ];
 RTC_NOINIT_ATTR int buflen, rtcqueued;
+RTC_NOINIT_ATTR int RTCseqnoUp, RTCseqnoDn;
+RTC_NOINIT_ATTR u4_t otaaDevAddr;
+RTC_NOINIT_ATTR u1_t otaaNetwKey[16];
+RTC_NOINIT_ATTR u1_t otaaApRtKey[16];
+#else
+#define RTCMAXOBJ 1000
+ sendObject_t objbuffer[RTCMAXOBJ];
+ int buflen, rtcqueued;
+ int RTCseqnoUp, RTCseqnoDn;
+ u4_t otaaDevAddr;
+ u1_t otaaNetwKey[16];
+ u1_t otaaApRtKey[16];
+#endif
+
 static int txcounter = 0;
 
 #include <TinyGPS++.h>
@@ -61,17 +84,13 @@ void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
 
-RTC_NOINIT_ATTR int RTCseqnoUp, RTCseqnoDn;
-RTC_NOINIT_ATTR u4_t otaaDevAddr;
-RTC_NOINIT_ATTR u1_t otaaNetwKey[16];
-RTC_NOINIT_ATTR u1_t otaaApRtKey[16];
 
 
 static osjob_t sendjob;
 
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 90;
+const unsigned TX_INTERVAL = 120;
 const unsigned GPS_INTERVAL = 60;
 
 // Pin mapping
@@ -237,7 +256,10 @@ void sleepfor (int s) {
   storeFrameCounters();
   Log.verbose(F("sleepfor(%d)"),s);
   esp_sleep_enable_timer_wakeup(s * 1000000);
+  #if DEEPSLEEP
   esp_deep_sleep_start();
+  #endif
+  Serial.flush();
   Log.verbose(F("light sleep: %d"),esp_light_sleep_start());
 
 }
@@ -257,7 +279,7 @@ void do_send(osjob_t* j){
         o = toprtcbuffer();
         if (o != NULL) {
           rtcqueued++;
-          LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 0);
+          LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 1);
           Log.verbose(F("Packet queued"));
         }
       } else {
@@ -367,9 +389,6 @@ void onEvent (ev_t ev) {
             // Disable link check validation (automatically enabled
             // during join, but not supported by TTN at this time).
             LMIC_setLinkCheckMode(0);
-            LMIC_setAdrMode(0);
-            LMIC.dn2Dr = DR_SF9; // added
-
             break;
         case EV_RFU1:
             Log.verbose(F("EV_RFU1"));
@@ -381,14 +400,15 @@ void onEvent (ev_t ev) {
             Log.verbose(F("EV_REJOIN_FAILED"));
             break;
         case EV_TXCOMPLETE:
-            txcounter = 0;
-            poprtcbuffer();
-            if (rtcqueued > 0)
-              rtcqueued--;
 
             Log.verbose(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK) {
               Log.verbose(F("Received ack"));
+              txcounter = 0;
+              poprtcbuffer();
+              if (rtcqueued > 0)
+                rtcqueued--;
+
             }
             if (LMIC.dataLen) {
               Log.verbose(F("Received %d bytes of payload"),LMIC.dataLen);
@@ -396,9 +416,7 @@ void onEvent (ev_t ev) {
             }
 
             storeFrameCounters();
-            // Schedule next transmission
-            // os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
-            //os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(10), do_send);
+            // Schedule next transmission immediately
             os_setCallback(&sendjob,do_send);
             break;
         case EV_LOST_TSYNC:
@@ -421,8 +439,8 @@ void onEvent (ev_t ev) {
             Log.verbose(F("EV_SCAN_FOUND"));
             break;
         case EV_TXSTART:
-            Log.verbose(F("EV_TXSTART: %d"),txcounter++);
-            if (txcounter >= 10)
+            Log.verbose(F("EV_TXSTART: %d"),++txcounter);
+            if (txcounter > 4)
               sleepfor(TX_INTERVAL);
             break;
         case EV_TXCANCELED:
@@ -497,7 +515,6 @@ void setup() {
   os_init();
     // Reset the MAC state. Session and pending data transfers will be discarded.
   LMIC_reset();
-  LMIC_setClockError(MAX_CLOCK_ERROR);
 
 
   esp_reset_reason_t reason = esp_reset_reason();
@@ -505,19 +522,12 @@ void setup() {
     LMIC_setSession(0x1, otaaDevAddr, otaaNetwKey, otaaApRtKey);
   }
   LMIC_setLinkCheckMode(0);
-  LMIC_setDrTxpow(DR_SF7,14);
-  // TTN uses SF9 for its RX2 window.
-  LMIC.dn2Dr = SF9;
 
   setOrRestorePersistentCounters();
 
   // setup gps
   Log.verbose(F("Initializing GPS"));
   GPS.begin(9600, SERIAL_8N1, 12, 15);
-  // read_GPS();
-
-  // Start job (sending automatically starts OTAA too)
-  // do_send(&sendjob);
 }
 
 
