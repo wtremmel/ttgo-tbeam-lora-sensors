@@ -11,12 +11,21 @@
 #define DEBUG 1
 #define BATTERY_PIN 35
 #define DEEPSLEEP 0
+#define DO_OTAA 1
+
 
 #if DEEPSLEEP
-#warning "Deep Sleep defined"
+#pragma message "Deep Sleep defined"
 #else
-#warning "Light Sleep defined"
+#pragma message "Light Sleep defined"
 #endif
+
+#if DO_OTAA
+#pragma message "OTAA Activation defined"
+#else
+#pragma message "APB Activation defined"
+#endif
+
 
 
 
@@ -26,6 +35,14 @@ typedef struct sendObject {
   uint32_t speed, direction;
   uint16_t voltage;
 } sendObject_t;
+
+typedef struct list {
+  sendObject_t *o;
+  struct list *nxt,*prv;
+} list_t;
+
+list_t *firstInList = NULL,
+  *lastInList = NULL;
 
 /*
 Payload decoder function:
@@ -42,28 +59,17 @@ function decodeUplink(input) {
     data: data
   };
 }
-}
 
 */
 
 sendObject_t whereAmI;
 
 #if DEEPSLEEP
-#define RTCMAXOBJ 100
-RTC_NOINIT_ATTR sendObject_t objbuffer[RTCMAXOBJ];
 RTC_NOINIT_ATTR int buflen, rtcqueued;
 RTC_NOINIT_ATTR int RTCseqnoUp, RTCseqnoDn;
 RTC_NOINIT_ATTR u4_t otaaDevAddr;
 RTC_NOINIT_ATTR u1_t otaaNetwKey[16];
 RTC_NOINIT_ATTR u1_t otaaApRtKey[16];
-#else
-#define RTCMAXOBJ 1000
- sendObject_t objbuffer[RTCMAXOBJ];
- int buflen, rtcqueued;
- int RTCseqnoUp, RTCseqnoDn;
- u4_t otaaDevAddr;
- u1_t otaaNetwKey[16];
- u1_t otaaApRtKey[16];
 #endif
 
 static int txcounter = 0;
@@ -78,12 +84,18 @@ bool led_dynamic = true; // LED shows if system is asleep or not
 bool gps_wait_for_lock = true;
 uint32_t lastGPS = 0;
 
-#include "tbeam.h"
 
+#if DO_OTAA
+#include "tbeam.h"
 void os_getArtEui (u1_t* buf) { memcpy_P(buf, APPEUI, 8);}
 void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 void os_getDevKey (u1_t* buf) { memcpy_P(buf, APPKEY, 16);}
-
+#else
+#include "tbeam-02.h"
+void os_getArtEui (u1_t* buf) { }
+void os_getDevEui (u1_t* buf) { }
+void os_getDevKey (u1_t* buf) { }
+#endif
 
 
 static osjob_t sendjob;
@@ -91,7 +103,7 @@ static osjob_t sendjob;
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
 const unsigned TX_INTERVAL = 120;
-const unsigned GPS_INTERVAL = 60;
+const unsigned GPS_INTERVAL = 30;
 
 // Pin mapping
 const lmic_pinmap lmic_pins = {
@@ -104,6 +116,7 @@ const lmic_pinmap lmic_pins = {
 // forward declarations
 void setup_I2C(void);
 
+#if DEEPSLEEP
 void storeFrameCounters() {
   RTCseqnoUp = LMIC.seqnoUp;
   RTCseqnoDn = LMIC.seqnoDn;
@@ -116,37 +129,91 @@ void restoreFrameCounters() {
   Log.verbose(F("Counters restored. up=%d down=%d"),RTCseqnoUp,RTCseqnoDn);
 
 }
+#endif
 
 bool pushrtcbuffer(sendObject_t *o) {
-  if (buflen < RTCMAXOBJ) {
-    memcpy((objbuffer + buflen),o,sizeof(sendObject_t));
-    buflen++;
-    return true;
-  }
-  return false;
-}
+  list_t *new_member;
 
-sendObject_t *toprtcbuffer() {
-  if (buflen > 0) {
-    return objbuffer + (buflen-1);
+
+  if (psramFound()) {
+    new_member = (list_t *)ps_malloc(sizeof(list_t));
+    if (new_member)
+      new_member->o = (sendObject_t *)ps_malloc(sizeof(sendObject_t));
   } else {
-    return NULL;
+    new_member = (list_t *)malloc(sizeof(list_t));
+    if (new_member)
+      new_member->o = (sendObject_t *)malloc(sizeof(sendObject_t));
   }
 
+  // check if we have generated an object
+  if (new_member && new_member->o) {
+    memcpy(new_member->o,o,sizeof(sendObject_t));
+
+    // add it to the chain at the end
+    // special case - chain is empty
+    if (lastInList == NULL) {
+      lastInList = new_member;
+      firstInList= new_member;
+      new_member->prv = NULL;
+      new_member->nxt = NULL;
+    } else {
+      new_member->prv = lastInList;
+      new_member->nxt = NULL;
+      lastInList->nxt = new_member;
+      lastInList = new_member;
+    }
+    return true;
+  } else {
+    return false;
+  }
 }
+
 
 sendObject_t *poprtcbuffer() {
-  if (buflen > 0) {
-    buflen--;
-    return objbuffer + buflen;
-  } else {
+  static sendObject_t o;
+  // remove last object of list
+  if (lastInList == NULL) {
+    // nothing to do, list is empty
     return NULL;
+  } else {
+    // do we have an object to copy?
+    if (lastInList->o == NULL) {
+      // no - dump the last element and return NULL
+      list_t *dumpit;
+      dumpit = lastInList;
+      lastInList = dumpit->prv;
+      if (lastInList == NULL)
+        firstInList = NULL;
+      else
+        lastInList->nxt = NULL;
+      free(dumpit);
+      return NULL;
+    } else {
+      memcpy(&o,lastInList->o,sizeof(sendObject_t));
+      free(lastInList->o);
+      list_t *dumpit;
+      dumpit = lastInList;
+      lastInList = dumpit->prv;
+      if (lastInList == NULL)
+        firstInList = NULL;
+      else
+        lastInList->nxt = NULL;
+      free(dumpit);
+      return &o;
+    }
   }
 }
 
 
 void dumprtcbuffer() {
   #if DEBUG
+  int buflen = 0;
+  list_t *o;
+  o = firstInList;
+  while (o && buflen < 10000) {
+    buflen++;
+    o = o->nxt;
+  }
 
   Log.verbose(F("buflen = %d"),buflen);
   #endif
@@ -253,10 +320,10 @@ void sleepfor (int s) {
   if (!setup_complete)
     return;
 
-  storeFrameCounters();
   Log.verbose(F("sleepfor(%d)"),s);
   esp_sleep_enable_timer_wakeup(s * 1000000);
   #if DEEPSLEEP
+  storeFrameCounters();
   esp_deep_sleep_start();
   #endif
   Serial.flush();
@@ -270,15 +337,15 @@ void do_send(osjob_t* j){
     // Check if there is not a current TX/RX job running
     if (LMIC.opmode & OP_TXRXPEND) {
       Log.notice(F("OP_TXRXPEND, not sending"));
+      // LMIC_clrTxData();
     } else {
         // Prepare upstream data transmission at the next possible time.
       // send data
-      if (buflen > 0) { //  && rtcqueued == 0) {
+      if (lastInList != NULL) { //
         sendObject_t *o;
         dumprtcbuffer();
-        o = toprtcbuffer();
+        o = lastInList->o;
         if (o != NULL) {
-          rtcqueued++;
           LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 1);
           Log.verbose(F("Packet queued"));
         }
@@ -382,9 +449,11 @@ void onEvent (ev_t ev) {
             break;
         case EV_JOINED:
             Log.verbose(F("EV_JOINED"));
+            #if DEEPSLEEP
             otaaDevAddr = LMIC.devaddr;
             memcpy_P(otaaNetwKey, LMIC.nwkKey, 16);
             memcpy_P(otaaApRtKey, LMIC.artKey, 16);
+            #endif
             Log.verbose(F("got devaddr = 0x%X"), LMIC.devaddr);
             // Disable link check validation (automatically enabled
             // during join, but not supported by TTN at this time).
@@ -406,16 +475,15 @@ void onEvent (ev_t ev) {
               Log.verbose(F("Received ack"));
               txcounter = 0;
               poprtcbuffer();
-              if (rtcqueued > 0)
-                rtcqueued--;
 
             }
             if (LMIC.dataLen) {
               Log.verbose(F("Received %d bytes of payload"),LMIC.dataLen);
               process_received_lora(LMIC.dataLen,LMIC.frame);
             }
-
+#if DEEPSLEEP
             storeFrameCounters();
+#endif
             // Schedule next transmission immediately
             os_setCallback(&sendjob,do_send);
             break;
@@ -440,7 +508,7 @@ void onEvent (ev_t ev) {
             break;
         case EV_TXSTART:
             Log.verbose(F("EV_TXSTART: %d"),++txcounter);
-            if (txcounter > 4)
+            if (txcounter > 4 && LMIC.devaddr)
               sleepfor(TX_INTERVAL);
             break;
         case EV_TXCANCELED:
@@ -458,7 +526,14 @@ void onEvent (ev_t ev) {
     }
 }
 
-
+void log_memory(bool all=true) {
+  if (all) {
+    Log.verbose(F("ESP total heap  %d"),ESP.getHeapSize());
+    Log.verbose(F("ESP total PSRAM %d"),ESP.getPsramSize());
+  }
+  Log.verbose(F("ESP free  heap %d"),ESP.getFreeHeap());
+  Log.verbose(F("ESP free PSRAM %d"),ESP.getFreePsram());
+}
 
 // Logging helper routines
 void printTimestamp(Print* _logOutput) {
@@ -479,13 +554,12 @@ void setup_logging() {
   Log.verbose("Logging has started");
 }
 
+#if DEEPSLEEP
 void setOrRestorePersistentCounters() {
   esp_reset_reason_t reason = esp_reset_reason();
   if ((reason != ESP_RST_DEEPSLEEP) && (reason != ESP_RST_SW)) {
     LMIC.seqnoUp = 0;
     LMIC.seqnoDn = 0;
-    buflen = 0;
-    rtcqueued = 0;
     gps_wait_for_lock = true;
     Log.verbose(F("rtc data initialized"));
   } else {
@@ -494,9 +568,8 @@ void setOrRestorePersistentCounters() {
   }
   Log.verbose(F("LMIC.seqnoUp = %d"),LMIC.seqnoUp);
   Log.verbose(F("LMIC.seqnoDn = %d"),LMIC.seqnoDn);
-  Log.verbose(F("buflen = %d"),buflen);
 }
-
+#endif
 
 void setup() {
   // WiFi.mode(WIFI_OFF);
@@ -511,19 +584,37 @@ void setup() {
 
   setup_logging();
   print_wakeup_reason(); // if wakeup
+  log_memory(true);
   // LMIC init
   os_init();
     // Reset the MAC state. Session and pending data transfers will be discarded.
   LMIC_reset();
 
-
+#if DO_OTAA
+  #if DEEPSLEEP
   esp_reset_reason_t reason = esp_reset_reason();
   if ((reason == ESP_RST_DEEPSLEEP) || (reason == ESP_RST_SW)) {
     LMIC_setSession(0x1, otaaDevAddr, otaaNetwKey, otaaApRtKey);
   }
-  LMIC_setLinkCheckMode(0);
-
   setOrRestorePersistentCounters();
+  #endif
+#else
+LMIC_setSession (0x13, DEVADDR, NWKSKEY, APPSKEY);
+LMIC_setupChannel(0, 868100000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);      // g-band
+LMIC_setupChannel(1, 868300000, DR_RANGE_MAP(DR_SF12, DR_SF7B), BAND_CENTI);      // g-band
+LMIC_setupChannel(2, 868500000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
+LMIC_setupChannel(3, 867100000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
+LMIC_setupChannel(4, 867300000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
+LMIC_setupChannel(5, 867500000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
+LMIC_setupChannel(6, 867700000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
+LMIC_setupChannel(7, 867900000, DR_RANGE_MAP(DR_SF12, DR_SF7),  BAND_CENTI);      // g-band
+LMIC_setupChannel(8, 868800000, DR_RANGE_MAP(DR_FSK,  DR_FSK),  BAND_MILLI);      // g2-band
+#endif
+
+  LMIC_setLinkCheckMode(0);
+  LMIC.dn2Dr = DR_SF9;
+  LMIC_setDrTxpow(DR_SF7,14);
+
 
   // setup gps
   Log.verbose(F("Initializing GPS"));
@@ -538,9 +629,10 @@ void loop() {
     Log.verbose("main loop: reading GPS");
     read_GPS();
     lastGPS = millis();
-    if (buflen > 0) {
+    if (lastInList != NULL) {
       do_send(&sendjob);
     }
+    log_memory(false);
   }
   setup_complete = true;
 
