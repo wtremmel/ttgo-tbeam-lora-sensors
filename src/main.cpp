@@ -38,6 +38,7 @@ typedef struct sendObject {
 
 typedef struct list {
   sendObject_t *o;
+  bool queued;
   struct list *nxt,*prv;
 } list_t;
 
@@ -148,6 +149,7 @@ bool pushrtcbuffer(sendObject_t *o) {
   // check if we have generated an object
   if (new_member && new_member->o) {
     memcpy(new_member->o,o,sizeof(sendObject_t));
+    new_member->queued = false;
 
     // add it to the chain at the end
     // special case - chain is empty
@@ -172,7 +174,7 @@ bool pushrtcbuffer(sendObject_t *o) {
 sendObject_t *poprtcbuffer() {
   static sendObject_t o;
   // remove last object of list
-  if (lastInList == NULL) {
+  if (lastInList == NULL || lastinlist->queued == false) {
     // nothing to do, list is empty
     return NULL;
   } else {
@@ -346,8 +348,9 @@ void do_send(osjob_t* j){
         dumprtcbuffer();
         o = lastInList->o;
         if (o != NULL) {
+          lastinlist->queued = true;
           LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 1);
-          Log.verbose(F("Packet queued"));
+          Log.verbose(F("Packet queued timestamp %l"),o->timestamp);
         }
       } else {
         sleepfor(TX_INTERVAL);
