@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <ArduinoLog.h>
 #include <esp_sleep.h>
+#include <esp_wifi.h>
 // #include <WiFi.h>
 
 
@@ -34,6 +35,7 @@ typedef struct sendObject {
   uint32_t gpslong, gpslat, gpsalt;
   uint32_t speed, direction;
   uint16_t voltage;
+  uint8_t listlen;
 } sendObject_t;
 
 typedef struct list {
@@ -45,25 +47,12 @@ typedef struct list {
 list_t *firstInList = NULL,
   *lastInList = NULL;
 
-/*
-Payload decoder function:
-function decodeUplink(input) {
-  var data = {};
-  data.timestamp = (input.bytes[0]) + (input.bytes[1]<<8) + (input.bytes[2]<<16) +  (input.bytes[3]<<24);
-  data.long = ((input.bytes[4]) + (input.bytes[5]<<8) + (input.bytes[6]<<16) +  (input.bytes[7]<<24)) / 10000.0;
-  data.lat = ((input.bytes[8]) + (input.bytes[9]<<8) + (input.bytes[10]<<16) +  (input.bytes[11]<<24)) / 10000.0;
-  data.alt = ((input.bytes[12]) + (input.bytes[13]<<8) + (input.bytes[14]<<16) +  (input.bytes[15]<<24)) / 100.0;
-  data.speed = ((input.bytes[16]) + (input.bytes[17]<<8) + (input.bytes[18]<<16) +  (input.bytes[19]<<24)) / 100.0;
-  data.direction = ((input.bytes[20]) + (input.bytes[21]<<8) + (input.bytes[22]<<16) +  (input.bytes[23]<<24)) / 100.0;
-  data.voltage = ((input.bytes[24]) + (input.bytes[25]<<8)) / 100.0
-  return {
-    data: data
-  };
-}
 
-*/
 
 sendObject_t whereAmI;
+float lastlat = 0, lastlong = 0;
+uint16_t lastVoltage = 0;
+uint8_t nopushfor = 0;
 
 #if DEEPSLEEP
 RTC_NOINIT_ATTR int buflen, rtcqueued;
@@ -81,10 +70,13 @@ TinyGPSPlus gps;
 
 
 bool setup_complete = false;
+bool doNotSleep = true;
 bool led_dynamic = true; // LED shows if system is asleep or not
 bool gps_wait_for_lock = true;
 uint32_t lastGPS = 0;
-
+//  GPS interval dependent on speed of movement
+// next time in millis() to get GPS
+uint32_t nextGPS = 0, nextLORA = 0, loraDelta = 0;
 
 #if DO_OTAA
 #include "tbeam.h"
@@ -101,10 +93,7 @@ void os_getDevKey (u1_t* buf) { }
 
 static osjob_t sendjob;
 
-// Schedule TX every this many seconds (might become longer due to duty
-// cycle limitations).
-const unsigned TX_INTERVAL = 120;
-const unsigned GPS_INTERVAL = 30;
+
 
 // Pin mapping
 const lmic_pinmap lmic_pins = {
@@ -174,7 +163,7 @@ bool pushrtcbuffer(sendObject_t *o) {
 sendObject_t *poprtcbuffer() {
   static sendObject_t o;
   // remove last object of list
-  if (lastInList == NULL || lastinlist->queued == false) {
+  if (lastInList == NULL || lastInList->queued == false) {
     // nothing to do, list is empty
     return NULL;
   } else {
@@ -206,6 +195,16 @@ sendObject_t *poprtcbuffer() {
   }
 }
 
+uint32_t rtcbuflen() {
+  list_t *o = firstInList;
+  uint32_t len = 0;
+
+  while (o) {
+    len++;
+    o = o->nxt;
+  }
+  return len;
+}
 
 void dumprtcbuffer() {
   #if DEBUG
@@ -253,10 +252,12 @@ void read_GPS() {
         gps_wait_for_lock = false;
     }
   } while (millis() - start < 2000 || gps_wait_for_lock);
-if (gps.charsProcessed() < 10) {
+  if (gps.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
+    nextGPS = millis() + 3*60*1000; // try again in 3 minutes
   } else {
     if (gps.location.isValid() && gps.location.isUpdated()) {
+      lastGPS = millis();
       Log.notice(F("GPS data: lat(%F) long(%F) height(%F)"),
         (double)(gps.location.lat()),
         (double)(gps.location.lng()),
@@ -286,7 +287,40 @@ if (gps.charsProcessed() < 10) {
       Log.verbose(F("ctime = %s"),ctime((time_t *) &whereAmI.timestamp));
 
       whereAmI.voltage = (uint16_t)(getBatteryVoltage() * 100.0);
-      pushrtcbuffer(&whereAmI);
+
+      // only push if we have changed location
+      if (abs(gps.location.lng()-lastlong) +
+          abs(gps.location.lat()-lastlat) > 0.0003 ||
+          abs(lastVoltage - whereAmI.voltage) >= 5 ||
+          nopushfor++ > 10
+        ) {
+        pushrtcbuffer(&whereAmI);
+        lastlat = gps.location.lat();
+        lastlong= gps.location.lng();
+        lastVoltage = whereAmI.voltage;
+        nopushfor = 0;
+      }
+
+
+      // calculate next data gathering
+      // speed = 0 -> 5 minutes
+      // speed < 3 -> 2 minutes
+      // speed < 30 -> 1 minute
+      // speed < 100 -> 30s
+      // speed > 100 -> 10s
+
+      if (whereAmI.speed < 10)
+        nextGPS = lastGPS+(5*60*1000);
+      else if (whereAmI.speed < 200)
+        nextGPS = lastGPS+(2*60*1000);
+      else if (whereAmI.speed < 1000)
+        nextGPS = lastGPS+(60*1000);
+      else if (whereAmI.speed < 5000)
+        nextGPS = lastGPS+(30*1000);
+      else
+        nextGPS = lastGPS+10000;
+    } else {
+      nextGPS = millis() + 3*60*1000;
     }
   }
 }
@@ -322,14 +356,14 @@ void sleepfor (int s) {
   if (!setup_complete)
     return;
 
-  Log.verbose(F("sleepfor(%d)"),s);
+  Log.verbose(F("sleepfor(%d seconds)"),s);
   esp_sleep_enable_timer_wakeup(s * 1000000);
   #if DEEPSLEEP
   storeFrameCounters();
   esp_deep_sleep_start();
   #endif
   Serial.flush();
-  Log.verbose(F("light sleep: %d"),esp_light_sleep_start());
+  Log.verbose(F("light sleep complete: %d"),esp_light_sleep_start());
 
 }
 
@@ -339,6 +373,7 @@ void do_send(osjob_t* j){
     // Check if there is not a current TX/RX job running
     if (LMIC.opmode & OP_TXRXPEND) {
       Log.notice(F("OP_TXRXPEND, not sending"));
+      loraDelta++;
       // LMIC_clrTxData();
     } else {
         // Prepare upstream data transmission at the next possible time.
@@ -348,12 +383,13 @@ void do_send(osjob_t* j){
         dumprtcbuffer();
         o = lastInList->o;
         if (o != NULL) {
-          lastinlist->queued = true;
+          uint32_t qlen = rtcbuflen();
+          lastInList->queued = true;
+          o->listlen = (qlen > 255) ? 255 : qlen;
+          doNotSleep = true;
           LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 1);
           Log.verbose(F("Packet queued timestamp %l"),o->timestamp);
         }
-      } else {
-        sleepfor(TX_INTERVAL);
       }
     }
     // Next TX is scheduled after TX_COMPLETE event.
@@ -448,6 +484,8 @@ void onEvent (ev_t ev) {
             Log.verbose(F("EV_BEACON_TRACKED"));
             break;
         case EV_JOINING:
+            // give it time to join
+            loraDelta = 120;
             Log.verbose(F("EV_JOINING"));
             break;
         case EV_JOINED:
@@ -475,10 +513,12 @@ void onEvent (ev_t ev) {
 
             Log.verbose(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK) {
-              Log.verbose(F("Received ack"));
               txcounter = 0;
               poprtcbuffer();
-
+              loraDelta =1;
+              nextLORA = millis() + (1000*loraDelta);
+              doNotSleep = false;
+              Log.verbose(F("Received ack, loraDelta=%d"),loraDelta);
             }
             if (LMIC.dataLen) {
               Log.verbose(F("Received %d bytes of payload"),LMIC.dataLen);
@@ -488,7 +528,7 @@ void onEvent (ev_t ev) {
             storeFrameCounters();
 #endif
             // Schedule next transmission immediately
-            os_setCallback(&sendjob,do_send);
+            // os_setCallback(&sendjob,do_send);
             break;
         case EV_LOST_TSYNC:
             Log.verbose(F("EV_LOST_TSYNC"));
@@ -510,9 +550,15 @@ void onEvent (ev_t ev) {
             Log.verbose(F("EV_SCAN_FOUND"));
             break;
         case EV_TXSTART:
-            Log.verbose(F("EV_TXSTART: %d"),++txcounter);
-            if (txcounter > 4 && LMIC.devaddr)
-              sleepfor(TX_INTERVAL);
+          if (loraDelta < 60*5) {
+            loraDelta++;
+            loraDelta *= 2;
+          }
+          Log.verbose(F("EV_TXSTART: txcounter=%d loraDelta=%d"),
+            ++txcounter,
+            loraDelta);
+          if (txcounter >= 4)
+            doNotSleep = false;
             break;
         case EV_TXCANCELED:
             Log.verbose(F("EV_TXCANCELED"));
@@ -577,6 +623,7 @@ void setOrRestorePersistentCounters() {
 void setup() {
   // WiFi.mode(WIFI_OFF);
   btStop();
+  esp_wifi_stop();
 
   adcAttachPin(BATTERY_PIN);
   // adcStart(BATTERY_PIN);
@@ -622,21 +669,44 @@ LMIC_setupChannel(8, 868800000, DR_RANGE_MAP(DR_FSK,  DR_FSK),  BAND_MILLI);    
   // setup gps
   Log.verbose(F("Initializing GPS"));
   GPS.begin(9600, SERIAL_8N1, 12, 15);
+  nextGPS = millis();
+  nextLORA= millis();
+  doNotSleep = true;
 }
 
 
 void loop() {
   os_runloop_once();
 
-  if (!setup_complete || (millis() > lastGPS + (GPS_INTERVAL * 1000))) {
+  if (!setup_complete || (millis() > nextGPS)) {
     Log.verbose("main loop: reading GPS");
     read_GPS();
-    lastGPS = millis();
-    if (lastInList != NULL) {
-      do_send(&sendjob);
-    }
-    log_memory(false);
+    Log.verbose("main loop: nextGPS = %l",nextGPS);
   }
+
+  if (!setup_complete || (millis() > nextLORA)) {
+    if (lastInList != NULL) {
+      Log.verbose("main loop: sending loraDelta = %d",loraDelta);
+      do_send(&sendjob);
+      nextLORA = millis() + (1000*loraDelta);
+      Log.verbose("main loop: nextLORA = %l",nextLORA);
+
+    } else { // nothing queued
+      nextLORA = nextGPS+1;
+      doNotSleep = false;
+    }
+  }
+
+  long int sleeptime = min(nextLORA-millis(),nextGPS-millis());
+  if (!doNotSleep && sleeptime > 10000 && setup_complete) {
+    Log.verbose("nextLora = %l",nextLORA);
+    Log.verbose("nextGPS  = %l",nextGPS);
+    Log.verbose("sleeptime= %l",sleeptime);
+    LMIC_clrTxData();
+    sleepfor(sleeptime / 1000);
+  }
+
   setup_complete = true;
+
 
 }
