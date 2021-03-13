@@ -45,7 +45,8 @@ typedef struct list {
 } list_t;
 
 list_t *firstInList = NULL,
-  *lastInList = NULL;
+  *lastInList = NULL,
+  *deletedList;
 
 
 
@@ -63,6 +64,7 @@ RTC_NOINIT_ATTR u1_t otaaApRtKey[16];
 #endif
 
 static int txcounter = 0;
+static int sendingType = 1; // 1 = confirmed, 0 = unconfirmed
 
 #include <TinyGPS++.h>
 HardwareSerial GPS(1);
@@ -159,8 +161,22 @@ bool pushrtcbuffer(sendObject_t *o) {
   }
 }
 
-
 sendObject_t *poprtcbuffer() {
+  // move last object of list to deletedList
+  if (lastInList == NULL || lastInList->queued == false) {
+    // nothing to do, list is empty
+    return NULL;
+  } else {
+    lastInList->nxt = deletedList;
+    deletedList = lastInList;
+    lastInList = deletedList->prv;
+    deletedList->prv = NULL;
+    lastInList->nxt = NULL;
+    return deletedList->o;
+  }
+}
+
+sendObject_t *poprtcbuffer2() {
   static sendObject_t o;
   // remove last object of list
   if (lastInList == NULL || lastInList->queued == false) {
@@ -387,7 +403,10 @@ void do_send(osjob_t* j){
           lastInList->queued = true;
           o->listlen = (qlen > 255) ? 255 : qlen;
           doNotSleep = true;
-          LMIC_setTxData2(1, (unsigned char *) o, sizeof(sendObject_t), 1);
+          LMIC_setTxData2(1,
+            (unsigned char *) o,
+            sizeof(sendObject_t),
+            sendingType);
           Log.verbose(F("Packet queued timestamp %l"),o->timestamp);
         }
       }
@@ -438,6 +457,12 @@ void process_system_command(unsigned char len, unsigned char *buffer) {
     case 0x04:
       process_system_set_epoch(len-1,buffer+1);
       break;
+    case 0x07:
+      // erase deleted queue
+      break;
+    case 0xff:
+      // Reboot
+      break;
   }
 }
 
@@ -445,6 +470,32 @@ void process_sensor_command(unsigned char len, unsigned char *buffer) {
   if (len == 0) {
     Log.error(F("Zero length sensor command"));
     return;
+  }
+}
+
+void process_transmission_command(unsigned char len, unsigned char *buffer) {
+  if (len == 0) {
+    Log.error(F("Zero length transmission command"));
+    return;
+  }
+  switch (buffer[0]) {
+    case 0x10:
+      sendingType = 0;
+      break;
+    case 0x11:
+      sendingType = 1;
+      break;
+    case 0x1f:
+      sendingType = 1;
+      break;
+    case 0x20:
+      // send complete queue now
+      break;
+    case 0x21:
+      // send deleted queue now
+      break;
+    default:
+      Log.error(F("Unknown transmission command 0x%X"),buffer[0]);
   }
 }
 
@@ -460,6 +511,8 @@ void process_received_lora(unsigned char len, unsigned char *buffer) {
     case 1:
       process_sensor_command(len-1,buffer+1);
       break;
+    case 2:
+      process_transmission_command(len-1,buffer+1);
     default:
       Log.error(F("Unknown command %d"),buffer[0]);
       break;
