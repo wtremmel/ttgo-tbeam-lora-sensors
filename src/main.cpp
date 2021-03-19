@@ -171,7 +171,8 @@ sendObject_t *poprtcbuffer() {
     deletedList = lastInList;
     lastInList = deletedList->prv;
     deletedList->prv = NULL;
-    lastInList->nxt = NULL;
+    if (lastInList != NULL)
+      lastInList->nxt = NULL;
     return deletedList->o;
   }
 }
@@ -305,8 +306,9 @@ void read_GPS() {
       whereAmI.voltage = (uint16_t)(getBatteryVoltage() * 100.0);
 
       // only push if we have changed location
-      if (abs(gps.location.lng()-lastlong) +
-          abs(gps.location.lat()-lastlat) > 0.0003 ||
+      if ((abs(gps.location.lng()-lastlong) +
+            abs(gps.location.lat()-lastlat) > 0.0003 &&
+            gps.speed.kmph() == 0) ||
           abs(lastVoltage - whereAmI.voltage) >= 5 ||
           nopushfor++ > 10
         ) {
@@ -326,13 +328,13 @@ void read_GPS() {
       // speed > 100 -> 10s
 
       if (whereAmI.speed < 10)
-        nextGPS = lastGPS+(5*60*1000);
+        nextGPS = lastGPS+(3*60*1000);
       else if (whereAmI.speed < 200)
-        nextGPS = lastGPS+(2*60*1000);
+        nextGPS = lastGPS+(1*60*1000);
       else if (whereAmI.speed < 1000)
-        nextGPS = lastGPS+(60*1000);
-      else if (whereAmI.speed < 5000)
         nextGPS = lastGPS+(30*1000);
+      else if (whereAmI.speed < 5000)
+        nextGPS = lastGPS+(20*1000);
       else
         nextGPS = lastGPS+10000;
     } else {
@@ -389,7 +391,7 @@ void do_send(osjob_t* j){
     // Check if there is not a current TX/RX job running
     if (LMIC.opmode & OP_TXRXPEND) {
       Log.notice(F("OP_TXRXPEND, not sending"));
-      loraDelta++;
+      loraDelta += 10;
       // LMIC_clrTxData();
     } else {
         // Prepare upstream data transmission at the next possible time.
@@ -481,6 +483,7 @@ void process_transmission_command(unsigned char len, unsigned char *buffer) {
   switch (buffer[0]) {
     case 0x10:
       sendingType = 0;
+      loraDelta = 1;
       break;
     case 0x11:
       sendingType = 1;
@@ -497,6 +500,8 @@ void process_transmission_command(unsigned char len, unsigned char *buffer) {
     default:
       Log.error(F("Unknown transmission command 0x%X"),buffer[0]);
   }
+  Log.notice(F("sendingType  %d"),sendingType);
+
 }
 
 void process_received_lora(unsigned char len, unsigned char *buffer) {
@@ -568,7 +573,7 @@ void onEvent (ev_t ev) {
             if (LMIC.txrxFlags & TXRX_ACK) {
               txcounter = 0;
               poprtcbuffer();
-              loraDelta =1;
+              loraDelta =10;
               nextLORA = millis() + (1000*loraDelta);
               doNotSleep = false;
               Log.verbose(F("Received ack, loraDelta=%d"),loraDelta);
@@ -615,6 +620,7 @@ void onEvent (ev_t ev) {
             break;
         case EV_TXCANCELED:
             Log.verbose(F("EV_TXCANCELED"));
+            txcounter = 0;
             break;
         case EV_RXSTART:
             Log.verbose(F("EV_RXSTART"));
@@ -735,6 +741,8 @@ void loop() {
     Log.verbose("main loop: reading GPS");
     read_GPS();
     Log.verbose("main loop: nextGPS = %l",nextGPS);
+    nextLORA = millis()-1;
+
   }
 
   if (!setup_complete || (millis() > nextLORA)) {
@@ -751,11 +759,12 @@ void loop() {
   }
 
   long int sleeptime = min(nextLORA-millis(),nextGPS-millis());
-  if (!doNotSleep && sleeptime > 10000 && setup_complete) {
+  if (!doNotSleep && sleeptime > 30000 && setup_complete) {
     Log.verbose("nextLora = %l",nextLORA);
     Log.verbose("nextGPS  = %l",nextGPS);
     Log.verbose("sleeptime= %l",sleeptime);
     LMIC_clrTxData();
+    txcounter=0;
     sleepfor(sleeptime / 1000);
   }
 
