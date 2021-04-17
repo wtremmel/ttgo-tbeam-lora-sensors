@@ -327,18 +327,12 @@ void read_GPS() {
       // speed < 100 -> 30s
       // speed > 100 -> 10s
 
-      if (whereAmI.speed < 10)
-        nextGPS = lastGPS+(3*60*1000);
-      else if (whereAmI.speed < 200)
-        nextGPS = lastGPS+(1*60*1000);
-      else if (whereAmI.speed < 1000)
-        nextGPS = lastGPS+(30*1000);
-      else if (whereAmI.speed < 5000)
-        nextGPS = lastGPS+(20*1000);
+      if (whereAmI.speed == 0)
+        nextGPS = lastGPS+(120*1000);
       else
-        nextGPS = lastGPS+10000;
+        nextGPS = lastGPS+(int(10.0 / (whereAmI.speed / 3.6))*1000);
     } else {
-      nextGPS = millis() + 3*60*1000;
+      nextGPS = millis() + 60*1000;
     }
   }
 }
