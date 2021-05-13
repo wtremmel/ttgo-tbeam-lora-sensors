@@ -3,3 +3,6 @@
 .piolibdeps
 .clang_complete
 .gcc-flags.json
+.DS_Store
+src/tbeam.h
+src/tbeam-02.h

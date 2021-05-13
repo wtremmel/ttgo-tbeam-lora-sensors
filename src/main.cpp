@@ -271,7 +271,7 @@ void read_GPS() {
   } while (millis() - start < 2000 || gps_wait_for_lock);
   if (gps.charsProcessed() < 10) {
     Log.notice(F("No GPS data received"));
-    nextGPS = millis() + 3*60*1000; // try again in 3 minutes
+    nextGPS = millis() + 1*60*1000; // try again in 1 minute
   } else {
     if (gps.location.isValid() && gps.location.isUpdated()) {
       lastGPS = millis();
@@ -306,19 +306,20 @@ void read_GPS() {
       whereAmI.voltage = (uint16_t)(getBatteryVoltage() * 100.0);
 
       // only push if we have changed location
-      if ((abs(gps.location.lng()-lastlong) +
-            abs(gps.location.lat()-lastlat) > 0.0003 &&
-            gps.speed.kmph() == 0) ||
-          abs(lastVoltage - whereAmI.voltage) >= 5 ||
-          nopushfor++ > 10
-        ) {
+      float gpsdelta = abs(gps.location.lng()-lastlong) +
+            abs(gps.location.lat()-lastlat);
+      if (gpsdelta > 0.0002 &&
+          int(gps.location.lng()) != 0 &&
+          int(gps.location.lat()) != 0
+          ) {
         pushrtcbuffer(&whereAmI);
         lastlat = gps.location.lat();
         lastlong= gps.location.lng();
         lastVoltage = whereAmI.voltage;
         nopushfor = 0;
+      } else {
+        Log.verbose(F("GPS delta too small (%F), not pushing"),gpsdelta);
       }
-
 
       // calculate next data gathering
       // speed = 0 -> 5 minutes
@@ -328,11 +329,14 @@ void read_GPS() {
       // speed > 100 -> 10s
 
       if (whereAmI.speed == 0)
-        nextGPS = lastGPS+(120*1000);
+        nextGPS = lastGPS+(60*1000);
       else
-        nextGPS = lastGPS+(int(10.0 / (whereAmI.speed / 3.6))*1000);
+        nextGPS = lastGPS+10*1000;
     } else {
-      nextGPS = millis() + 60*1000;
+      Log.verbose(F("GPS valid: %T GPS update: %T"),
+        gps.location.isValid(),
+        gps.location.isUpdated());
+      nextGPS = millis() + 5*1000;
     }
   }
 }
